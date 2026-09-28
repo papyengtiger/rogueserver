@@ -16,3 +16,4 @@ secret.key
 .vscode/
 
 /.vs
+certs/
