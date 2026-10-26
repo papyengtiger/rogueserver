@@ -121,7 +121,11 @@ func validateSystemVersion(systemData defs.SystemSaveData, oldSystem defs.System
 	if minVerCmp > 0 {
 		return ErrVersionTooLow
 	}
-
+        log.Printf(
+    "[HIDDEN_EPIC_VERSION_CHECK] existing=%q incoming=%q",
+    oldSystem.GameVersion,
+    systemData.GameVersion,
+)
 	saveVerCmp, err := savedata.CompareGameVersion(oldSystem.GameVersion, systemData.GameVersion)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrVersionCompare, err)
