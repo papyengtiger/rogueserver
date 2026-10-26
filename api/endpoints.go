@@ -114,7 +114,7 @@ func validatePlaytime(systemData defs.SystemSaveData, oldSystem defs.SystemSaveD
 //
 // Returns `nil` if the version and migrators are valid, otherwise returns an error indicating the issue.
 func validateSystemVersion(systemData defs.SystemSaveData, oldSystem defs.SystemSaveData) error {
-	minVerCmp, err := savedata.CompareGameVersion("1.12.0.10", systemData.GameVersion)
+	minVerCmp, err := savedata.CompareGameVersion("0.0.1", systemData.GameVersion)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrVersionCompare, err)
 	}
