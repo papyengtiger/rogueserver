@@ -121,11 +121,11 @@ func validateSystemVersion(systemData defs.SystemSaveData, oldSystem defs.System
 	if minVerCmp > 0 {
 		return ErrVersionTooLow
 	}
-        log.Printf(
-    "[HIDDEN_EPIC_VERSION_CHECK] existing=%q incoming=%q",
-    oldSystem.GameVersion,
-    systemData.GameVersion,
-)
+	log.Printf(
+		"[HIDDEN_EPIC_VERSION_CHECK] existing=%q incoming=%q",
+		oldSystem.GameVersion,
+		systemData.GameVersion,
+	)
 	saveVerCmp, err := savedata.CompareGameVersion(oldSystem.GameVersion, systemData.GameVersion)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrVersionCompare, err)
@@ -281,14 +281,12 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = db.Store.UpdateActiveSession(uuid, r.URL.Query().Get("clientSessionId"))
-	if err != nil {
-		httpError(w, r, fmt.Errorf("failed to update active session: %s", err), http.StatusBadRequest)
-		return
-	}
-
 	switch r.PathValue("action") {
 	case "get":
+		if err := db.Store.UpdateActiveSession(uuid, r.URL.Query().Get("clientSessionId")); err != nil {
+			httpError(w, r, err, http.StatusInternalServerError)
+			return
+		}
 		save, err := savedata.GetSession(db.Store, uuid, slot)
 		if err != nil {
 			if errors.Is(err, savedata.ErrSaveNotExist) {
@@ -309,22 +307,13 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		existingSave, err := savedata.GetSession(db.Store, uuid, slot)
+		err = db.Store.SaveSessionAtomic(r.Context(), uuid, slot, session, nil, r.URL.Query().Get("clientSessionId"), nil)
 		if err != nil {
-			if !errors.Is(err, savedata.ErrSaveNotExist) {
-				httpError(w, r, fmt.Errorf("failed to retrieve session save data: %s", err), http.StatusInternalServerError)
-				return
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrStaleSessionWave) || errors.Is(err, db.ErrInactiveSaveClient) {
+				status = http.StatusBadRequest
 			}
-		} else {
-			if existingSave.Seed == session.Seed && existingSave.WaveIndex > session.WaveIndex {
-				httpError(w, r, fmt.Errorf("session out of date: existing wave index is greater"), http.StatusBadRequest)
-				return
-			}
-		}
-
-		err = savedata.UpdateSession(db.Store, uuid, slot, session)
-		if err != nil {
-			httpError(w, r, fmt.Errorf("failed to put session data: %s", err), http.StatusInternalServerError)
+			httpError(w, r, err, status)
 			return
 		}
 
@@ -343,13 +332,15 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		resp, err := savedata.Clear(db.Store, uuid, slot, seed, session)
+		success, err := db.Store.ClearSessionAtomic(r.Context(), uuid, slot, r.URL.Query().Get("clientSessionId"), session, seed, savedata.SessionCompletedForAtomicClear(session))
 		if err != nil {
-			httpError(w, r, err, http.StatusInternalServerError)
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrClearSaveMismatch) || errors.Is(err, db.ErrSaveSlotMissing) { status = http.StatusConflict }
+			httpError(w, r, err, status)
 			return
 		}
 
-		writeJSON(w, r, resp)
+		writeJSON(w, r, savedata.ClearResponse{Success: success})
 	case "newclear":
 		resp, err := savedata.NewClear(db.Store, uuid, slot)
 		if err != nil {
@@ -359,9 +350,11 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, r, resp)
 	case "delete":
-		err := savedata.DeleteSession(db.Store, uuid, slot)
+		err := db.Store.DeleteSessionAtomic(r.Context(), uuid, slot, r.URL.Query().Get("clientSessionId"))
 		if err != nil {
-			httpError(w, r, err, http.StatusInternalServerError)
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrInactiveSaveClient) { status = http.StatusConflict }
+			httpError(w, r, err, status)
 			return
 		}
 
@@ -399,65 +392,29 @@ func handleUpdateAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	active, err := db.Store.IsActiveSession(uuid, data.ClientSessionId)
-	if err != nil {
-		httpError(w, r, fmt.Errorf("failed to check active session: %s", err), http.StatusBadRequest)
+	// Validation and both writes happen under the same MariaDB account row lock.
+	if data.SessionSlotId < 0 || data.SessionSlotId >= defs.SessionSlotCount {
+		httpError(w, r, fmt.Errorf("invalid save slot: %d", data.SessionSlotId), http.StatusBadRequest)
 		return
 	}
-
-	if !active {
-		httpError(w, r, fmt.Errorf("session out of date: not active"), http.StatusBadRequest)
-		return
-	}
-
-	code, err := validateOrCreateIds(uuid, data.System)
+	err = db.Store.SaveSessionAtomic(r.Context(), uuid, data.SessionSlotId, data.Session, &data.System, data.ClientSessionId,
+		func(oldSystem defs.SystemSaveData, exists bool) error {
+			if !exists {
+				return nil
+			}
+			if err := validatePlaytime(data.System, oldSystem); err != nil {
+				return err
+			}
+			return validateSystemVersion(data.System, oldSystem)
+		})
 	if err != nil {
-		httpError(w, r, err, code)
-		return
-	}
-
-	oldSystem, err := savedata.GetSystem(db.Store, uuid)
-	if err != nil {
-		if !errors.Is(err, savedata.ErrSaveNotExist) {
-			httpError(w, r, fmt.Errorf("failed to retrieve playtime: %s", err), http.StatusInternalServerError)
-			return
+		status := http.StatusInternalServerError
+		if errors.Is(err, db.ErrStaleSessionWave) || errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrSaveTrainerIDs) ||
+			errors.Is(err, ErrGreaterPlaytime) || errors.Is(err, ErrNoPlaytime) || errors.Is(err, ErrVersionTooLow) ||
+			errors.Is(err, ErrExistingVersionGreater) || errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) {
+			status = http.StatusBadRequest
 		}
-	} else {
-		err = validatePlaytime(data.System, oldSystem)
-		if err != nil {
-			httpError(w, r, err, http.StatusBadRequest)
-			return
-		}
-
-		err = validateSystemVersion(data.System, oldSystem)
-		if err != nil {
-			httpError(w, r, err, http.StatusBadRequest)
-			return
-		}
-	}
-
-	existingSave, err := savedata.GetSession(db.Store, uuid, data.SessionSlotId)
-	if err != nil {
-		if !errors.Is(err, savedata.ErrSaveNotExist) {
-			httpError(w, r, fmt.Errorf("failed to retrieve session save data: %s", err), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		if existingSave.Seed == data.Session.Seed && existingSave.WaveIndex > data.Session.WaveIndex {
-			httpError(w, r, fmt.Errorf("session out of date: existing wave index is greater"), http.StatusBadRequest)
-			return
-		}
-	}
-
-	err = savedata.Update(db.Store, uuid, data.SessionSlotId, data.Session)
-	if err != nil {
-		httpError(w, r, err, http.StatusInternalServerError)
-		return
-	}
-
-	err = savedata.Update(db.Store, uuid, 0, data.System)
-	if err != nil {
-		httpError(w, r, err, http.StatusInternalServerError)
+		httpError(w, r, err, status)
 		return
 	}
 

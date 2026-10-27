@@ -31,3 +31,8 @@ func validateSessionCompleted(session defs.SessionSaveData) bool {
 
 	return false
 }
+
+// SessionCompletedForAtomicClear uses the existing completion criteria.
+func SessionCompletedForAtomicClear(session defs.SessionSaveData) bool {
+	return validateSessionCompleted(session)
+}
