@@ -18,6 +18,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -378,12 +379,22 @@ func (s *store) IsActiveSession(uuid []byte, sessionId string) (bool, error) {
 }
 
 func (s *store) UpdateActiveSession(uuid []byte, clientSessionId string) error {
-	_, err := handle.Exec("INSERT INTO activeClientSessions (uuid, clientSessionId) VALUES (?, ?) ON DUPLICATE KEY UPDATE clientSessionId = ?", uuid, clientSessionId, clientSessionId)
+	tx, err := handle.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
 
-	return nil
+	var id []byte
+	if err := tx.QueryRow("SELECT uuid FROM accounts WHERE uuid = ? FOR UPDATE", uuid).Scan(&id); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("INSERT INTO activeClientSessions (uuid, clientSessionId) VALUES (?, ?) ON DUPLICATE KEY UPDATE clientSessionId = ?", uuid, clientSessionId, clientSessionId); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (s *store) FetchUUIDFromToken(token []byte) ([]byte, error) {
