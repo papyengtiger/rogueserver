@@ -335,7 +335,9 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 		success, err := db.Store.ClearSessionAtomic(r.Context(), uuid, slot, r.URL.Query().Get("clientSessionId"), session, seed, savedata.SessionCompletedForAtomicClear(session))
 		if err != nil {
 			status := http.StatusInternalServerError
-			if errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrClearSaveMismatch) || errors.Is(err, db.ErrSaveSlotMissing) { status = http.StatusConflict }
+			if errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrClearSaveMismatch) || errors.Is(err, db.ErrSaveSlotMissing) {
+				status = http.StatusConflict
+			}
 			httpError(w, r, err, status)
 			return
 		}
@@ -353,7 +355,9 @@ func handleSession(w http.ResponseWriter, r *http.Request) {
 		err := db.Store.DeleteSessionAtomic(r.Context(), uuid, slot, r.URL.Query().Get("clientSessionId"))
 		if err != nil {
 			status := http.StatusInternalServerError
-			if errors.Is(err, db.ErrInactiveSaveClient) { status = http.StatusConflict }
+			if errors.Is(err, db.ErrInactiveSaveClient) {
+				status = http.StatusConflict
+			}
 			httpError(w, r, err, status)
 			return
 		}
@@ -477,48 +481,35 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, save)
 	case "update":
 		if !active {
-			httpError(w, r, fmt.Errorf("session out of date: not active"), http.StatusBadRequest)
+			httpError(w, r, db.ErrInactiveSaveClient, http.StatusBadRequest)
 			return
 		}
-
 		var system defs.SystemSaveData
-		err = json.NewDecoder(r.Body).Decode(&system)
-		if err != nil {
+		if err = json.NewDecoder(r.Body).Decode(&system); err != nil {
 			httpError(w, r, fmt.Errorf("failed to decode request body: %s", err), http.StatusBadRequest)
 			return
 		}
-
-		code, err := validateOrCreateIds(uuid, system)
+		err = db.Store.UpdateSystemAtomic(r.Context(), uuid, system, r.URL.Query().Get("clientSessionId"),
+			func(oldSystem defs.SystemSaveData, exists bool) error {
+				if !exists {
+					return nil
+				}
+				if err := validatePlaytime(system, oldSystem); err != nil {
+					return err
+				}
+				return validateSystemVersion(system, oldSystem)
+			})
 		if err != nil {
-			httpError(w, r, err, code)
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrSaveTrainerIDs) ||
+				errors.Is(err, ErrGreaterPlaytime) || errors.Is(err, ErrNoPlaytime) ||
+				errors.Is(err, ErrVersionTooLow) || errors.Is(err, ErrExistingVersionGreater) ||
+				errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) {
+				status = http.StatusBadRequest
+			}
+			httpError(w, r, err, status)
 			return
 		}
-
-		oldSystem, err := savedata.GetSystem(db.Store, uuid)
-		if err != nil {
-			if !errors.Is(err, savedata.ErrSaveNotExist) {
-				httpError(w, r, fmt.Errorf("failed to retrieve playtime: %s", err), http.StatusInternalServerError)
-				return
-			}
-		} else {
-			err = validatePlaytime(system, oldSystem)
-			if err != nil {
-				httpError(w, r, err, http.StatusBadRequest)
-				return
-			}
-			err = validateSystemVersion(system, oldSystem)
-			if err != nil {
-				httpError(w, r, err, http.StatusBadRequest)
-				return
-			}
-		}
-
-		err = savedata.UpdateSystem(db.Store, uuid, system)
-		if err != nil {
-			httpError(w, r, fmt.Errorf("failed to put system data: %s", err), http.StatusInternalServerError)
-			return
-		}
-
 		w.WriteHeader(http.StatusNoContent)
 	case "verify":
 		response := SystemVerifyResponse{
@@ -544,12 +535,15 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, r, response)
 	case "delete":
-		err := savedata.DeleteSystem(db.Store, uuid)
+		err = db.Store.DeleteSystemAtomic(r.Context(), uuid, r.URL.Query().Get("clientSessionId"))
 		if err != nil {
-			httpError(w, r, err, http.StatusInternalServerError)
+			status := http.StatusInternalServerError
+			if errors.Is(err, db.ErrInactiveSaveClient) {
+				status = http.StatusBadRequest
+			}
+			httpError(w, r, err, status)
 			return
 		}
-
 		w.WriteHeader(http.StatusOK)
 	default:
 		httpError(w, r, fmt.Errorf("unknown action"), http.StatusBadRequest)
