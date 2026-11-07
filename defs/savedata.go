@@ -17,6 +17,8 @@
 
 package defs
 
+import "encoding/json"
+
 const SessionSlotCount = 5
 
 type SystemSaveData struct {
@@ -38,32 +40,159 @@ type SystemSaveData struct {
 	GameVersion        string             `json:"gameVersion"`
 	Timestamp          int                `json:"timestamp"`
 	AppliedMigrators   map[string]int     `json:"appliedMigrators"`
+
+	// Hidden Epic account-wide state. Raw JSON remains lossless for evolving
+	// client-side object layouts, while gob stores the byte slices in MariaDB.
+	ClearVoucherRewards json.RawMessage `json:"clearVoucherRewards"`
+	CompanionData       json.RawMessage `json:"companionData"`
+	RoguePoints         json.RawMessage `json:"roguePoints"`
+	LastAttendanceDate  json.RawMessage `json:"lastAttendanceDate"`
+	AttendanceCount     json.RawMessage `json:"attendanceCount"`
+	AchvPointsGranted   json.RawMessage `json:"achvPointsGranted"`
+	BankMoney           json.RawMessage `json:"bankMoney"`
+	BankRoguePoints     json.RawMessage `json:"bankRoguePoints"`
+	QuestList           json.RawMessage `json:"questList"`
+	StorageItems        json.RawMessage `json:"storageItems"`
+	PracticeDummyConfig json.RawMessage `json:"practiceDummyConfig"`
+	PracticePresets     json.RawMessage `json:"practicePresets"`
+	PendingRunItems     json.RawMessage `json:"pendingRunItems"`
+	UsedCoupons         json.RawMessage `json:"usedCoupons"`
+	BerryPlanterSlots   json.RawMessage `json:"berryPlanterSlots"`
+	ResourceInventory   json.RawMessage `json:"resourceInventory"`
+
+	// Preserve later client additions instead of discarding them during Decode.
+	HiddenEpicExtra map[string]json.RawMessage `json:"-"`
 }
 
 type DexData map[int]DexEntry
 
 type DexEntry struct {
-	SeenAttr     interface{} `json:"seenAttr"`   // integer or string
-	CaughtAttr   interface{} `json:"caughtAttr"` // integer or string
-	NatureAttr   int         `json:"natureAttr"`
-	SeenCount    int         `json:"seenCount"`
-	CaughtCount  int         `json:"caughtCount"`
-	HatchedCount int         `json:"hatchedCount"`
-	Ivs          []int       `json:"ivs"`
-	Ribbons      string      `json:"ribbons"`
+	SeenAttr        interface{}                `json:"seenAttr"`   // integer or string
+	CaughtAttr      interface{}                `json:"caughtAttr"` // integer or string
+	NatureAttr      int                        `json:"natureAttr"`
+	SeenCount       int                        `json:"seenCount"`
+	CaughtCount     int                        `json:"caughtCount"`
+	HatchedCount    int                        `json:"hatchedCount"`
+	Ivs             []int                      `json:"ivs"`
+	Ribbons         string                     `json:"ribbons"`
+	HiddenEpicExtra map[string]json.RawMessage `json:"-"`
 }
 
 type StarterData map[int]StarterEntry
 
 type StarterEntry struct {
-	Moveset         interface{} `json:"moveset"`
-	EggMoves        int         `json:"eggMoves"`
-	CandyCount      int         `json:"candyCount"`
-	Friendship      int         `json:"friendship"`
-	AbilityAttr     int         `json:"abilityAttr"`
-	PassiveAttr     int         `json:"passiveAttr"`
-	ValueReduction  int         `json:"valueReduction"`
-	ClassicWinCount int         `json:"classicWinCount"`
+	Moveset         interface{}                `json:"moveset"`
+	EggMoves        int                        `json:"eggMoves"`
+	CandyCount      int                        `json:"candyCount"`
+	Friendship      int                        `json:"friendship"`
+	AbilityAttr     int                        `json:"abilityAttr"`
+	PassiveAttr     int                        `json:"passiveAttr"`
+	ValueReduction  int                        `json:"valueReduction"`
+	ClassicWinCount int                        `json:"classicWinCount"`
+	HiddenEpicExtra map[string]json.RawMessage `json:"-"`
+}
+
+// preserveUnknownFields collects client extensions not recognized by the Go
+// struct, allowing them to survive JSON -> gob -> JSON round-trips.
+func preserveUnknownFields(input []byte, knownJSON []byte) (map[string]json.RawMessage, error) {
+	var incoming map[string]json.RawMessage
+	if err := json.Unmarshal(input, &incoming); err != nil {
+		return nil, err
+	}
+	var known map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &known); err != nil {
+		return nil, err
+	}
+	for k := range known {
+		delete(incoming, k)
+	}
+	return incoming, nil
+}
+
+func marshalWithUnknownFields(known any, extra map[string]json.RawMessage) ([]byte, error) {
+	data, err := json.Marshal(known)
+	if err != nil || len(extra) == 0 {
+		return data, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for k, v := range extra {
+		if _, exists := fields[k]; !exists {
+			fields[k] = v
+		}
+	}
+	return json.Marshal(fields)
+}
+
+func (s *SystemSaveData) UnmarshalJSON(data []byte) error {
+	type plain SystemSaveData
+	var tmp plain
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	known, err := json.Marshal(tmp)
+	if err != nil {
+		return err
+	}
+	tmp.HiddenEpicExtra, err = preserveUnknownFields(data, known)
+	if err != nil {
+		return err
+	}
+	*s = SystemSaveData(tmp)
+	return nil
+}
+
+func (s SystemSaveData) MarshalJSON() ([]byte, error) {
+	type plain SystemSaveData
+	return marshalWithUnknownFields(plain(s), s.HiddenEpicExtra)
+}
+
+func (s *DexEntry) UnmarshalJSON(data []byte) error {
+	type plain DexEntry
+	var tmp plain
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	known, err := json.Marshal(tmp)
+	if err != nil {
+		return err
+	}
+	tmp.HiddenEpicExtra, err = preserveUnknownFields(data, known)
+	if err != nil {
+		return err
+	}
+	*s = DexEntry(tmp)
+	return nil
+}
+
+func (s DexEntry) MarshalJSON() ([]byte, error) {
+	type plain DexEntry
+	return marshalWithUnknownFields(plain(s), s.HiddenEpicExtra)
+}
+
+func (s *StarterEntry) UnmarshalJSON(data []byte) error {
+	type plain StarterEntry
+	var tmp plain
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	known, err := json.Marshal(tmp)
+	if err != nil {
+		return err
+	}
+	tmp.HiddenEpicExtra, err = preserveUnknownFields(data, known)
+	if err != nil {
+		return err
+	}
+	*s = StarterEntry(tmp)
+	return nil
+}
+
+func (s StarterEntry) MarshalJSON() ([]byte, error) {
+	type plain StarterEntry
+	return marshalWithUnknownFields(plain(s), s.HiddenEpicExtra)
 }
 
 type StarterMoveData map[int]interface{}

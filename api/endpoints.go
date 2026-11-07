@@ -62,6 +62,95 @@ var ErrMigratorsDesynced = errors.New("session out of date: migrators desynced")
 	Handler functions are responsible for checking the validity of this data and returning a result or error.
 	Handlers should not return serialized JSON, instead return the struct itself.
 */
+// ErrMissingHiddenEpicSaveData rejects a system save that would silently erase
+// account-wide Hidden Epic state. It is safe for older *stored* saves to lack
+// these fields; new incoming saves must provide them explicitly.
+var ErrMissingHiddenEpicSaveData = errors.New("missing or invalid Hidden Epic system save data")
+
+// validateHiddenEpicSystemSave ensures the essential fields exist in every
+// incoming save (including first saves), and preserves optional fields already
+// present in an older server record. Zero balances and empty lists are valid.
+func validateHiddenEpicSystemSave(incoming defs.SystemSaveData, old defs.SystemSaveData, exists bool) error {
+	present := func(raw json.RawMessage) bool {
+		trimmed := strings.TrimSpace(string(raw))
+		return trimmed != "" && trimmed != "null"
+	}
+	checkNumber := func(name string, raw json.RawMessage) error {
+		if !present(raw) {
+			return fmt.Errorf("%w: %s", ErrMissingHiddenEpicSaveData, name)
+		}
+		var value int64
+		if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
+			return fmt.Errorf("%w: %s must be a non-negative integer", ErrMissingHiddenEpicSaveData, name)
+		}
+		return nil
+	}
+	checkArray := func(name string, raw json.RawMessage) error {
+		if !present(raw) {
+			return fmt.Errorf("%w: %s", ErrMissingHiddenEpicSaveData, name)
+		}
+		var value []json.RawMessage
+		if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+			return fmt.Errorf("%w: %s must be an array", ErrMissingHiddenEpicSaveData, name)
+		}
+		return nil
+	}
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"roguePoints", incoming.RoguePoints},
+		{"bankMoney", incoming.BankMoney},
+		{"bankRoguePoints", incoming.BankRoguePoints},
+	} {
+		if err := checkNumber(field.name, field.raw); err != nil {
+			return err
+		}
+	}
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"storageItems", incoming.StorageItems},
+		{"questList", incoming.QuestList},
+	} {
+		if err := checkArray(field.name, field.raw); err != nil {
+			return err
+		}
+	}
+	// Optional extensions can be absent in old DB records, but once present
+	// they may not silently disappear in a future full-replacement save.
+	if exists {
+		for _, field := range []struct {
+			name          string
+			before, after json.RawMessage
+		}{
+			{"clearVoucherRewards", old.ClearVoucherRewards, incoming.ClearVoucherRewards},
+			{"companionData", old.CompanionData, incoming.CompanionData},
+			{"lastAttendanceDate", old.LastAttendanceDate, incoming.LastAttendanceDate},
+			{"attendanceCount", old.AttendanceCount, incoming.AttendanceCount},
+			{"achvPointsGranted", old.AchvPointsGranted, incoming.AchvPointsGranted},
+			{"practiceDummyConfig", old.PracticeDummyConfig, incoming.PracticeDummyConfig},
+			{"practicePresets", old.PracticePresets, incoming.PracticePresets},
+			{"pendingRunItems", old.PendingRunItems, incoming.PendingRunItems},
+			{"usedCoupons", old.UsedCoupons, incoming.UsedCoupons},
+			{"berryPlanterSlots", old.BerryPlanterSlots, incoming.BerryPlanterSlots},
+			{"resourceInventory", old.ResourceInventory, incoming.ResourceInventory},
+		} {
+			if present(field.before) && !present(field.after) {
+				return fmt.Errorf("%w: %s", ErrMissingHiddenEpicSaveData, field.name)
+			}
+		}
+		// Preserve future account-wide fields carried in the extension map.
+		for name, previous := range old.HiddenEpicExtra {
+			if present(previous) && !present(incoming.HiddenEpicExtra[name]) {
+				return fmt.Errorf("%w: %s", ErrMissingHiddenEpicSaveData, name)
+			}
+		}
+	}
+	return nil
+}
+
 // account
 
 // Helper method that validates the trainer and secret IDs in the system save data against the database's
@@ -403,6 +492,9 @@ func handleUpdateAll(w http.ResponseWriter, r *http.Request) {
 	}
 	err = db.Store.SaveSessionAtomic(r.Context(), uuid, data.SessionSlotId, data.Session, &data.System, data.ClientSessionId,
 		func(oldSystem defs.SystemSaveData, exists bool) error {
+			if err := validateHiddenEpicSystemSave(data.System, oldSystem, exists); err != nil {
+				return err
+			}
 			if !exists {
 				return nil
 			}
@@ -415,7 +507,7 @@ func handleUpdateAll(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusInternalServerError
 		if errors.Is(err, db.ErrStaleSessionWave) || errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrSaveTrainerIDs) ||
 			errors.Is(err, ErrGreaterPlaytime) || errors.Is(err, ErrNoPlaytime) || errors.Is(err, ErrVersionTooLow) ||
-			errors.Is(err, ErrExistingVersionGreater) || errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) {
+			errors.Is(err, ErrExistingVersionGreater) || errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) || errors.Is(err, ErrMissingHiddenEpicSaveData) {
 			status = http.StatusBadRequest
 		}
 		httpError(w, r, err, status)
@@ -491,6 +583,9 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 		}
 		err = db.Store.UpdateSystemAtomic(r.Context(), uuid, system, r.URL.Query().Get("clientSessionId"),
 			func(oldSystem defs.SystemSaveData, exists bool) error {
+				if err := validateHiddenEpicSystemSave(system, oldSystem, exists); err != nil {
+					return err
+				}
 				if !exists {
 					return nil
 				}
@@ -504,7 +599,7 @@ func handleSystem(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(err, db.ErrInactiveSaveClient) || errors.Is(err, db.ErrSaveTrainerIDs) ||
 				errors.Is(err, ErrGreaterPlaytime) || errors.Is(err, ErrNoPlaytime) ||
 				errors.Is(err, ErrVersionTooLow) || errors.Is(err, ErrExistingVersionGreater) ||
-				errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) {
+				errors.Is(err, ErrVersionCompare) || errors.Is(err, ErrMigratorsDesynced) || errors.Is(err, ErrMissingHiddenEpicSaveData) {
 				status = http.StatusBadRequest
 			}
 			httpError(w, r, err, status)
